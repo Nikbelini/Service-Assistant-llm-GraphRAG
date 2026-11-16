@@ -71,7 +71,7 @@ def _part(value) -> tuple[str | None, str | None]:
     code = normalize_code(value) if isinstance(value, str) else None
 
     if code is None or code_type(code) != "Part":
-        return None, f"Некорректный номер детали {value!r}: нужен вид P-1042 или P-1042B"
+        return None, f"некорректный номер детали {value!r}: нужен вид P-1042 или P-1042B"
 
     return code, None
 
@@ -117,7 +117,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         if error:
             return {"error": error}
 
-        return _erp(lambda: erp.get_price(code))
+        return _erp(lambda: erp.get_price(code, warehouse))
 
 
     def get_price(part_id: str) -> dict:
