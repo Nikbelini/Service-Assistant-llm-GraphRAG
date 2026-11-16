@@ -38,6 +38,14 @@ def _name(graph: nx.DiGraph, node: str) -> str:
     return graph.nodes[node].get("name", node)
 
 
+def _line_of(graph: nx.DiGraph, model: str) -> str:
+    for target in graph.successors(model):
+        if graph.edges[model, target]["type"] == "BELONGS_TO":
+            return _name(graph, target)
+
+    return "без линейки"
+
+
 def community_facts(community: Community, graph: nx.DiGraph) -> str:
     """Факты и подсчёты сообщества, готовые для запроса к модели"""
     members = set(community.nodes)
@@ -53,10 +61,7 @@ def community_facts(community: Community, graph: nx.DiGraph) -> str:
 
     for source, target, data in edges:
         if data["type"] == "FAILED":
-            line = next(
-                (_name(graph, t) for t in graph.successors(source) if graph.edges[source, t]["type"] == "BELONGS_TO"), "без линейки"
-            )
-            failures[line][_name(graph, target)] += data.get("weight", 1)
+            failures[_line_of(graph, source)][_name(graph, target)] += data.get("weight", 1)
 
     for line, counter in sorted(failures.items()):
         ranking = ", ".join(f"{name} - {count}" for name, count in counter.most_common())

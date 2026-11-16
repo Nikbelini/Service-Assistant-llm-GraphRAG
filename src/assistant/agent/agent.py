@@ -157,7 +157,8 @@ def run_agent(
                 known = set(find_codes(question)) | set(find_codes(known_codes_text()))
                 problem = next(
                     (
-                        f"код {args[k]} не встречался ни в вопросе, ни в результатах инструментов; сначала вызови search_knowledge"
+                        f"код {args[k]} не встречался ни в вопросе, ни в результатах инструментов; "
+                        "сначала вызови search_knowledge"
                         for k in ("part_id", "model")
                         if k in args and isinstance(args[k], str) and normalize_code(args[k]) and args[k] not in known
                     ), None
@@ -220,7 +221,8 @@ def run_agent(
             response.as_message(),
             {
                 "role": "user",
-                "content": f"В ответе есть данные, которых нет в вопросе и результатах инструментов: {', '.join(unsupported)}. "
+                "content": f"В ответе есть данные, которых нет в вопросе и результатах инструментов: "
+                f"{', '.join(unsupported)}. "
                 "Исправь ответ: используй только данные из вопроса и результатов инструментов."
             }
         ]
