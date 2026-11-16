@@ -7,7 +7,6 @@ import networkx as nx
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import Community
 
-
 SEED = 42
 MAX_WORDS = 150
 MAX_EDGES_IN_PROMPT = 40
