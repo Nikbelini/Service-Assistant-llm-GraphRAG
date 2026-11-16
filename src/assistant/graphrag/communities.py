@@ -68,7 +68,7 @@ def community_facts(community: Community, graph: nx.DiGraph) -> str:
 
     lines.append("Самые тяжёлые связи (вес - число документов, где связь найдена):")
 
-    for source. target, data in edges[:MAX_EDGES_IN_PROMPT]:
+    for source, target, data in edges[:MAX_EDGES_IN_PROMPT]:
         lines.append(f"{_name(graph, source)} -{data['type']}-> {_name(graph, target)} (вес {data.get('weight', 1)})")
 
     return "\n".join(lines)

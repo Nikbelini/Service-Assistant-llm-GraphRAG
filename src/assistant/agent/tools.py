@@ -11,7 +11,7 @@ from assistant.infra.schemas import KnowledgeBase
 # Описания пяти инструментов в формате function calling:
 # search_knowledge, summarize_topic, check_stock, get_price, create_service_order.
 # заполните список. У параметра warehouse четыре склада задаются перечислением.
-WAREHOUSES = ["Москва", "Санкт-Петербург", "Казань", "Екатеринбург"]
+WAREHOUSES = ["Москва", "Санкт-Петербург", "Казань", "Новосибирск"]
 
 
 def _tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -117,7 +117,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         if error:
             return {"error": error}
 
-        return _erp(lambda: erp.get_price(code, warehouse))
+        return _erp(lambda: erp.get_stock(code, warehouse))
 
 
     def get_price(part_id: str) -> dict:
