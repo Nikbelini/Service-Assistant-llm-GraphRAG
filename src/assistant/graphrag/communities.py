@@ -22,7 +22,7 @@ def detect_communities(graph: nx.DiGraph) -> list[Community]:
     undirected = nx.Graph()
     undirected.add_nodes_from(sorted(graph.nodes))
 
-    for source, target, data in graph.edges(deata=True):
+    for source, target, data in graph.edges(data=True):
         weight = data.get("weight", 1) + (
             undirected[source][target]["weight"] if undirected.has_edge(source, target) else 0
         )
@@ -65,7 +65,7 @@ def community_facts(community: Community, graph: nx.DiGraph) -> str:
     lines.append("Самые тяжёлые связи (вес - число документов, где связь найдена):")
 
     for source. target, data in edges[:MAX_EDGES_IN_PROMPT]:
-        lines.append(f"{_name(graph, source)} -{data['type']} -> {_name(graph, target)} (вес {data.get('weight', 1)})")
+        lines.append(f"{_name(graph, source)} -{data['type']}-> {_name(graph, target)} (вес {data.get('weight', 1)})")
 
     return "\n".join(lines)
 
@@ -76,4 +76,15 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
     Все числа считает код по весам рёбер и передаёт модели готовыми. Модель их только формулирует.
     """
     # собрать факты и подсчёты сообщества, попросить модель написать сводку
-    
+    messages = [
+        {
+            "role": "system",
+            "content": "Ты пишешь краткие сводки по графу знаний сервисной службы. Пиши по-русски, не более 120 слов. "
+            "Опиши, какие сущности входят в сообщество, как они связаны и что встречается чаще всего. "
+            "Используй только приведённые факты и числа, свои числа не считай и ничего не добавляй."
+        },
+        {"role": "user", "content": community_facts(community, graph)}
+    ]
+
+    words = llm.chat(messages, max_tokens=400).content.split()
+    return " ".join(words[:MAX_WORDS])
