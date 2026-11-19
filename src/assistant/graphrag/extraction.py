@@ -3,7 +3,7 @@
 import json
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import canonical_name, find_codes
+from assistant.infra.grounding import canonical_name, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import (
     ENTITY_TYPES,
@@ -16,6 +16,7 @@ from assistant.infra.schemas import (
 )
 
 CODE_TYPES = ("Model", "Part", "ErrorCode", "Procedure")
+MAX_TOKENS = 6000
 
 SYSTEM_PROMPT = """Ты извлекаешь граф знаний из фрагмента сервисной документации по холодильному оборудованию.
 Верни только JSON с полями entities и relations.
@@ -39,16 +40,32 @@ SYSTEM_PROMPT = """Ты извлекаешь граф знаний из фраг
 - SUPPLIED_BY: Part -> Supplier (деталь поставляет поставщик)
 - FAILED: Model -> Component (в отчёте о выезде у модели зафиксирован отказ узла)
 
+Словарь названий (только эти названия): {vocabulary}
+
 Правила:
 1. Извлекай только то, что сказано в тексте. Не выдумывай коды и названия.
-2. Названия линеек, узлов и поставщиков бери только из словаря:
-{vocabulary}
-3. Номера документов (SB-..., R-...) сущностями не являются.
-4. Регламент плановых работ, где нет ошибки, детали или отказа, даёт пустые списки.
-5. Коды записывай в каноническом виде: прописные латинские буквы, дефис, цифры
-(ar 210 -> AR-210, Е-17 с русской Е -> E-17).
+2. Номера документов (SB-..., R-...) сущностями не являются.
+3. Коды записывай в каноническом виде: прописные латинские буквы, дефис, цифры
+   (ar 210 -> AR-210, Е-17 с русской Е -> E-17). Список кодов текста дан под фрагментом.
+4. Все связи пиши в relations. В entities перечисляй только сущности, не попавшие ни в одну связь.
+5. Не пропускай строки: каждая подходящая строка текста даёт все свои связи.
+6. Регламент плановых работ, где нет ошибки, детали или отказа, даёт пустые списки.
 
-Пример. Текст: «Деталь P-1042 (пусковое реле) снята с производства, вместо неё P-1042B.
+Как читать типовые места текста:
+- Строка списка узлов «- компрессор – деталь P-1010, поставщик «КомпрессорМаш»» в руководстве модели AR-210 даёт
+  три связи: AR-210 HAS_PART P-1010; P-1010 IS_A компрессор; P-1010 SUPPLIED_BY КомпрессорМаш.
+  Если в списке 8 строк, связей должно быть 24.
+- Фраза «входит в линейку «Арктика»» даёт: AR-210 BELONGS_TO Арктика.
+- Строка таблицы ошибок «- E-17 – нет пускового тока, отказ узла «пусковое реле»» даёт: E-17 INDICATES пусковое реле.
+  Каждая строка таблицы даёт ровно одну связь INDICATES.
+- Регламент «применяется при ошибке E-17 ... отказ узла «пусковое реле»» даёт: E-17 FIXED_BY SP-104 и
+  E-17 INDICATES пусковое реле. Регламент плановых работ связей не даёт.
+- Бюллетень «Деталь P-1042 (пусковое реле) снята с производства. Вместо неё P-1042B. Поставщик детали P-1042B –
+  «ХолодКомплект»» даёт: P-1042 REPLACED_BY P-1042B; P-1042 IS_A пусковое реле; P-1042B SUPPLIED_BY ХолодКомплект.
+  Бюллетень о дефекте партии без замены: поставщик и деталь с узлом дают IS_A и SUPPLIED_BY, REPLACED_BY нет.
+- Отчёт «Оборудование: витрина ar 320 ... код Е-17 ... отказ узла: пусковое реле» даёт: AR-320 FAILED пусковое реле.
+
+Полный пример ответа для бюллетеня. Текст: «Деталь P-1042 (пусковое реле) снята с производства, вместо неё P-1042B.
 Поставщик P-1042B – ООО «ХолодКомплект»».
 Ответ: {example}"""
 
@@ -114,6 +131,22 @@ def _confirm(entity_type: str, raw: str, chunk_codes: set[str], vocab: dict) -> 
     return Entity(entity_type, name)
 
 
+def _hints(chunk: Chunk, vocab: dict) -> str:
+    codes = ", ".join(find_codes(chunk.text)) or "нет"
+    names = ", ".join(name for _, name in find_names(chunk.text, vocab)) or "нет"
+
+    return f"Коды в тексте (канонический вид): {codes}\nНазвания из словаря, найденные в тексте: {names}"
+
+
+def _fit(relation: Relation) -> Relation | None:
+    """Связь по схеме. Если концы перепутаны местами, то разворачиваются"""
+    if relation.matches_schema():
+        return relation
+
+    flipped = Relation(relation.object, relation.type, relation.subject)
+    return flipped if flipped.matches_schema() else None
+
+
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     """Возвращает сущности и связи чанка строго по схеме графа.
 
@@ -125,24 +158,29 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     """
     # запрос к модели, разбор JSON, проверки по тексту чанка и словарю
     vocab = vocabulary()
-    messages = [
+    system = SYSTEM_PROMPT.format(vocabulary=json.dumps(vocab, ensure_ascii=False), example=_example())
+    user = f"Идентификатор фрагмента: {chunk.chunk_id}\n\nТекст:\n{chunk.text}\n\n{_hints(chunk, vocab)}"
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    retry = [
+        *messages[:1],
         {
-            "role": "system",
-            "content": SYSTEM_PROMPT.format(vocabulary=json.dumps(vocab, ensure_ascii=False), example=_example())
-        },
-        {"role": "user", "content": f"Идентификатор фрагмента: {chunk.chunk_id}\n\nТекст:\n{chunk.text}"}
+            "role": "user",
+            "content": user + "\n\nПредыдущий ответ не разобрался. Верни компактный JSON по схеме, "
+            "entities оставь пустым списком, все связи пиши в relations.",
+        }
     ]
 
     parsed = None
-    for _ in range(2):
-        parsed = _parse(llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=2048).content)
+    for attempt in (messages, retry):
+        parsed = _parse(llm.chat(attempt, json_schema=EXTRACTION_SCHEMA, max_tokens=MAX_TOKENS).content)
         if parsed is not None:
             break
 
     result = ExtractionResult(chunk.chunk_id, chunk.doc_id)
     if parsed is None:
         return result
-
+    
     raw_entities, raw_relations = parsed
     chunk_codes = set(find_codes(chunk.text))
     seen: dict[str, Entity] = {}
@@ -161,15 +199,15 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     for item in raw_relations:
         subject = _confirm(item["subject_type"], item["subject"], chunk_codes, vocab)
         obj = _confirm(item["object_type"], item["object"], chunk_codes, vocab)
-        relation = Relation(subject, item["type"], obj) if subject and obj else None
+        relation = _fit(Relation(subject, item["type"], obj)) if subject and obj else None
 
         if relation is None or item["type"] not in RELATION_SIGNATURES or not relation.matches_schema():
             result.dropped += 1
             continue
 
-        keep(subject)
-        keep(obj)
-        relations.setdefault((subject.node_id, relation.type, obj.node_id), relation)
+        keep(relation.subject)
+        keep(relation.obj)
+        relations.setdefault((relation.subject.node_id, relation.type, relation.object.node_id), relation)
 
     result.entities = list(seen.values())
     result.relations = list(relations.values())

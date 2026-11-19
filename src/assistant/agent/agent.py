@@ -23,14 +23,34 @@ SCHEMAS = {s["function"]["name"]: s["function"]["parameters"] for s in TOOL_SCHE
 
 SYSTEM_PROMPT = f"""Ты ассистент сервисной службы по холодильному оборудованию. Отвечай по-русски, коротко.
 Правила:
-1. Номер детали узнавай через search_knowledge. Не придумывай номера, цены и остатки:
+1. Номер детали узнавай только через search_knowledge. Не придумывай номера, цены и остатки:
 цену и остаток дают только get_price и check_stock.
-2. Если деталь заменена, для цены, остатка и заказа используй последнюю деталь цепочки замен.
-3. Склад для check_stock и create_service_order бери из вопроса. Количество для заказа бери только из вопроса.
+2. search_knowledge возвращает факты. Если деталь снята с производства, в фактах есть строка
+«актуальная деталь вместо неё»: для цены, остатка и заказа бери именно эту деталь.
+3. Склад бери из вопроса в именительном падеже: «в Казани» -> Казань, «в Новосибирске» -> Новосибирск.
+Количество для заказа бери только из вопроса.
 4. create_service_order вызывай, только если пользователь просит оформить заказ.
-5. Обзорные вопросы про весь корпус или линейку решай через summarize_topic.
-6. Если данных нет, ответь ровно: «{NOT_FOUND}»
-7. Если инструмент вернул error, не повторяй тот же вызов; расскажи об ошибке."""
+5. Обзорные вопросы про всю базу или линейку решай через summarize_topic.
+6. Цену и остаток спрашивай отдельными вызовами: check_stock для остатка, get_price для цены.
+7. Если инструмент вернул error, не повторяй тот же вызов; расскажи об ошибке.
+8. Если данных нет, ответь ровно: «{NOT_FOUND}»
+
+Пример. Вопрос: «Ошибка E-17 на AR-210. Какую деталь заказать, есть ли она в Казани и сколько стоит?»
+Шаги: search_knowledge(вопрос) -> актуальная деталь P-1042B; check_stock(P-1042B, Казань); get_price(P-1042B);
+затем короткий ответ с номером детали, остатком и ценой из результатов."""
+
+
+def _normalize_warehouse(args: dict) -> dict:
+    """в Казани -> Казань: склад в падежной форме приводится к названию из списка."""
+    value = args.get("warehouse")
+    if isinstance(value, str) and value not in WAREHOUSES:
+        stem = value.strip().lower()[:5]
+        match = [name for name in WAREHOUSES if len(stem) >= 4 and name.lower().startswith(stem)]
+        
+        if len(match) == 1:
+            return {**args, "warehouse": match[0]}
+        
+    return args
 
 
 def _numbers(text: str) -> set[str]:
@@ -147,6 +167,7 @@ def run_agent(
             elif set(args) != set(schema["required"]):
                 result = reject(call, args, f"нужны ровно аргументы: {', '.join(schema['required'])}")
             else:
+                args = _normalize_warehouse(args)
                 for key in ("part_id", "model"):
                     code = normalize_code(args[key]) if isinstance(args.get(key), str) else None
 
@@ -179,7 +200,7 @@ def run_agent(
                     if args["warehouse"] not in WAREHOUSES:
                         result = reject(call, args, f"неизвестный склад {args['warehouse']!r}")
                     else:
-                        steps.append(ToolStep(call.name, args, {"status": "pending_confirmation"}, None))
+                        steps.append(ToolStep(call.name, args, None, "количество не названо в вопросе"))
                         text = (
                             f"Нужно подтверждение: заказ {args['qty']} шт. детали {args['part_id']} на складе"
                             f"{args['warehouse']} для модели {args['model']}. Заказ не создан"
