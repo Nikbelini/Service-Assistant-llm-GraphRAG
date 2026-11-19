@@ -60,10 +60,10 @@ def _anchors(question: str, kb: KnowledgeBase) -> tuple[list[str], bool]:
 
 def _add_real_edges(graph: nx.DiGraph, edges: dict[tuple[str, str], int], a: str, b: str, rank: int) -> None:
     """Добавляет только реально существующие направленные рёбра"""
-    if graph.has_edges(a, b):
+    if graph.has_edge(a, b):
         edges[(a, b)] = min(edges.get((a, b), rank), rank)
 
-    if graph.has_edges(b, a):
+    if graph.has_edge(b, a):
         edges[(b, a)] = min(edges.get((b, a), rank), rank)
 
 
@@ -119,7 +119,7 @@ def _edge_ids(graph: nx.DiGraph, undirected: nx.Graph, anchors: list[str]) -> li
                     continue
 
                 rank = len(path) - 1
-                for a, b in zip(path, path[1:]):
+                for a, b in zip(path, path[1:], strict=False):
                     _add_real_edges(graph, edges, a, b, rank)
 
                 accepted += 1
@@ -192,9 +192,14 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     messages = [
         {
             "role": "system",
-            "content": "Ты отвечаешь на вопросы сервисной службы только по списку фактов. Не добавляй сведения, которых нет в фактах. "
-                "Если есть цепочка REPLACED_BY, укажи последнюю деталь этой цепочки. Не путай детали разных моделей. Коды переписывай точно. "
-                f"Если ответа в фактах нет, напиши ровно: «{NOT_FOUND}». Отвечай кратко и прямо на вопрос."
+            "content": (
+                "Ты отвечаешь на вопросы сервисной службы только по списку фактов. "
+                "Не добавляй сведения, которых нет в фактах. "
+                "Если есть цепочка REPLACED_BY, укажи последнюю деталь этой цепочки. "
+                "Не путай детали разных моделей. Коды переписывай точно. "
+                f"Если ответа в фактах нет, напиши ровно: «{NOT_FOUND}». "
+                "Отвечай кратко и прямо на вопрос."
+            ),             
         },
         {"role": "user", "content": "Факты графа:\n" + "\n".join(facts) + f"\n\nВопрос: {question}"}
     ]
