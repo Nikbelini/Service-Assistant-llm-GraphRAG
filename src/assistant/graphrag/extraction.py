@@ -206,7 +206,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
             continue
 
         keep(relation.subject)
-        keep(relation.obj)
+        keep(relation.object)
         relations.setdefault((relation.subject.node_id, relation.type, relation.object.node_id), relation)
 
     result.entities = list(seen.values())
