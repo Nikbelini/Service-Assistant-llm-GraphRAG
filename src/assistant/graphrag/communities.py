@@ -50,8 +50,7 @@ def _line_of(graph: nx.DiGraph, model: str) -> str:
 
 
 def failure_statistics(graph: nx.DiGraph) -> dict[str, Counter]:
-    """
-    """
+    """Отказы по всему графу. Считается по рёбрам FAILED от моделей. Сообщества сюда не входят"""
     failures: dict[str, Counter] = defaultdict(Counter)
     for source, target, data in graph.edges(data=True):
         if data.get("type") != "FAILED":

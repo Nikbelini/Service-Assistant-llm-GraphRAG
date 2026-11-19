@@ -20,7 +20,7 @@ NEIGHBOURHOOD_DEPTH = 2
 
 
 def _doc(chunk_id: str) -> str:
-    return chunk_id.split("#", 1)[0]
+    return chunk_id.split("#")[0]
 
 
 def _stem_match(name: str, lowered: str) -> bool:
