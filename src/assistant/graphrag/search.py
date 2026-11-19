@@ -12,18 +12,21 @@ from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
 
 NOT_FOUND = "В базе знаний не найдено"
 MAX_FACTS_CHARS = 8000
-MAX_PATH_LEN = 3
+
+MAX_PATH_LEN = 5
+MAX_PATHS_PER_PAIR = 100
+MAX_REPLACEMENT_DEPTH = 12
 NEIGHBOURHOOD_DEPTH = 2
 
 
 def _doc(chunk_id: str) -> str:
-    return chunk_id.split("#")[0]
+    return chunk_id.split("#", 1)[0]
 
 
 def _stem_match(name: str, lowered: str) -> bool:
     """Название узла в любой падежной форме: каждое слово встречается по основе"""
     words = name.lower().split()
-    return all(word in lowered or (len(word) > 4 and word[: len(word) - 2] in lowered) for word in words)
+    return all(word in lowered or (len(word) > 4 and word[:-2] in lowered) for word in words)
 
 
 def _anchors(question: str, kb: KnowledgeBase) -> tuple[list[str], bool]:
@@ -36,13 +39,15 @@ def _anchors(question: str, kb: KnowledgeBase) -> tuple[list[str], bool]:
         if node not in kb.graph:
             return [], True
 
-        anchors.append(node)
+        if node not in anchors:
+            anchors.append(node)
 
-    lowered = question.lower()
+
+    lowered = question.lower().replace("ё", "е")
     names = {(kind, name) for kind, name in find_names(question, kb.vocabulary)}
 
     for kind, values in kb.vocabulary.items():
-        names.update((kind, name) for name in values if _stem_match(name, lowered))
+        names.update((kind, name) for name in values if _stem_match(name.lower().replace("ё", "е"), lowered))
 
     for kind, name in sorted(names):
         node = f"{kind}:{name}"
@@ -53,20 +58,74 @@ def _anchors(question: str, kb: KnowledgeBase) -> tuple[list[str], bool]:
     return anchors, False
 
 
+def _add_real_edges(graph: nx.DiGraph, edges: dict[tuple[str, str], int], a: str, b: str, rank: int) -> None:
+    """Добавляет только реально существующие направленные рёбра"""
+    if graph.has_edges(a, b):
+        edges[(a, b)] = min(edges.get((a, b), rank), rank)
+
+    if graph.has_edges(b, a):
+        edges[(b, a)] = min(edges.get((b, a), rank), rank)
+
+
+def _replacement_edges(graph: nx.DiGraph, edges: dict[tuple[str, str], int], parts: set[str]) -> None:
+    """Добавляет полные цепочки REPLACED_BY, включая ветвления, без зацикливания"""
+    for start in sorted(parts):
+        queue: list[tuple[str, int, frozenset[str]]] = [(start, 0, frozenset({start}))]
+
+        while queue:
+            current, depth, visited = queue.pop(0)
+
+            if depth >= MAX_REPLACEMENT_DEPTH:
+                continue
+
+            successors = sorted(
+                (
+                    target for target in graph.successors(current)
+                    if graph.edges[current, target].get("type") == "REPLACED_BY"
+                ),
+                key=lambda target: (-graph.edges[current, target].get("weight", 1), target)
+            )
+
+            for target in successors:
+                if target in visited:
+                    continue
+
+                edges[(current, target)] = min(edges.get((current, target), 0), 0)
+                queue.append((target, depth + 1, visited | {target}))
+
+
 def _edge_ids(graph: nx.DiGraph, undirected: nx.Graph, anchors: list[str]) -> list[tuple[str, str]]:
     """Рёбра на путях между опорными узлами либо в окрестности единственного узла"""
     edges: dict[tuple[str, str], int] = {}
 
-    def add(a: str, b: str, rank: int) -> None:
-        pair = (a, b) if graph.has_edge(a, b) else (b, a)
-        edges.setdefault(pair, rank)
-
     if len(anchors) >= 2:
         for first, second in combinations(anchors, 2):
-            for path in nx.all_simple_paths(undirected, first, second, cutoff=MAX_PATH_LEN):
-                for a, b in zip(path, path[1:], strict=False):
-                    add(a, b, len(path))
-    else:
+            if first not in undirected or second not in undirected:
+                continue
+
+            if not nx.has_path(undirected, first, second):
+                continue
+
+            # Ищем короткие простые пути, но не разрешаем обход через третью
+            paths = nx.all_simple_paths(
+                undirected, first, second, cutoff=MAX_PATH_LEN
+            )
+
+            accepted = 0
+            for path in paths:
+                intermediate = path[1:-1]
+
+                if any(graph.nodes[node].get("type") in {"Model", "ProductLine"} for node in intermediate):
+                    continue
+
+                rank = len(path) - 1
+                for a, b in zip(path, path[1:]):
+                    _add_real_edges(graph, edges, a, b, rank)
+
+                accepted += 1
+                if accepted >= MAX_PATHS_PER_PAIR:
+                    break
+    elif anchors:
         frontier = {anchors[0]}
         seen = set(frontier)
 
@@ -74,35 +133,24 @@ def _edge_ids(graph: nx.DiGraph, undirected: nx.Graph, anchors: list[str]) -> li
             following: set[str] = set()
 
             for node in sorted(frontier):
-                for other in undirected.neighbors(node):
-                    add(node, other, depth)
+                for other in sorted(undirected.neighbors(node)):
+                    _add_real_edges(graph, edges, node, other, depth)
 
                     if other not in seen:
                         following.add(other)
 
-            seen |= following
+            seen.update(following)
             frontier = following
 
     parts = {node for pair in edges for node in pair if graph.nodes[node]["type"] == "Part"}
+    _replacement_edges(graph, edges, parts)
 
-    for part in sorted(parts):
-        # цепочки замен вперёд до последней детали
-        current = part
-
-        while True:
-            nxt = next((t for t in graph.successors(current) if graph.edges[current, t]["type"] == "REPLACED_BY"), None)
-            if nxt is None or (current, nxt) in edges:
-                break
-
-            edges[(current, nxt)] = 0
-            current = nxt
-
-    return sorted(edges, key=lambda pair: (edges[pair], -graph.edges[pair].get("weight", 1), pair))
+    return sorted(edges, key=lambda pair: (edges[pair], -graph.edges[pair].get("weight", 1), pair[0],  pair[1]))
 
 
 def _fact(graph: nx.DiGraph, source: str, target: str) -> str:
     data = graph.edges[source, target]
-    text = f"{graph.nodes[source]['name']} -{data['type']}-> {graph.nodes[target]['name']}"
+    text = f"{graph.nodes[source].get('name', source)} -{data['type']}-> {graph.nodes[target].get('name', source)}"
     return text + (f" (найдено в {data['weight']} документах)" if data.get("weight", 1) > 1 else "")
 
 
@@ -129,11 +177,11 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     size = 0
 
     for source, target in pairs:
-        line = f"{len(facts) + 1}. {_fact(graph, source, target)}"
-
+        fact = _fact(graph, source, target)
+        line = f"{len(facts) + 1}. {fact}"   
         if size + len(line) + 1 > MAX_FACTS_CHARS:
-            break
-
+            continue
+        
         facts.append(line)
         used.append((source, target))
         size += len(line) + 1
@@ -144,16 +192,17 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     messages = [
         {
             "role": "system",
-            "content": "Ты отвечаешь на вопросы сервисной службы только по списку фактов. Ничего не добавляй от себя. "
-            "Если деталь заменена (REPLACED_BY), называй последнюю деталь цепочки замен. "
-            "Коды переписывай точно. Если в фактах нет ответа, напиши: «В базе знаний не найдено.» Отвечай коротко.",
+            "content": "Ты отвечаешь на вопросы сервисной службы только по списку фактов. Не добавляй сведения, которых нет в фактах. "
+                "Если есть цепочка REPLACED_BY, укажи последнюю деталь этой цепочки. Не путай детали разных моделей. Коды переписывай точно. "
+                f"Если ответа в фактах нет, напиши ровно: «{NOT_FOUND}». Отвечай кратко и прямо на вопрос."
         },
-        {"role": "user", "content": "Факты:\n" + "\n".join(facts) + f"\n\nВопрос: {question}"}
+        {"role": "user", "content": "Факты графа:\n" + "\n".join(facts) + f"\n\nВопрос: {question}"}
     ]
 
     text = llm.chat(messages).content.strip()
     sources = sorted({_doc(chunk) for pair in used for chunk in graph.edges[pair].get("sources", [])})
-    return Answer(text, sources, [line.split(". ", 1)[1] for line in facts], refused=False)
+    refused = not text or ("не найдено" in text.lower() and "базе знаний" in text.lower())
+    return Answer(text or NOT_FOUND, sources, [line.split(". ", 1)[1] for line in facts], refused)
 
 
 def _parse_partial(content: str) -> tuple[str, int] | None:
@@ -184,7 +233,6 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
-    # частичные ответы по сводкам, объединение
     partials: list[tuple[int, str, object]] = []
 
     for community in kb.communities:
@@ -193,7 +241,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                 "role": "system",
                 "content": "Тебе дана сводка части графа знаний сервисной службы и вопрос. Ответь на вопрос по сводке "
                 'и оцени полезность сводки для ответа от 0 до 10. Верни JSON {"answer": "...", "score": N}. '
-                "Если в сводке ответа нет, score равен 0.",
+                "score от 0 до 10. Если сведений для ответа нет, score=0.",
             },
             {"role": "user", "content": f"Сводка:\n{community.summary}\n\nВопрос: {question}"}
         ]
@@ -205,14 +253,15 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     if not partials:
         return Answer(NOT_FOUND, refused=True)
 
-    partials.sort(key=lambda item: -item[0])
+    partials.sort(key=lambda item: (-item[0], item[1]))
     joined = "\n".join(f"{i}. (оценка {score}) {answer}" for i, (score, answer, _) in enumerate(partials, start=1))
 
     messages = [
         {
             "role": "system",
             "content": "Объедини частичные ответы в один итоговый ответ на вопрос. Используй только их содержание, "
-            "числа и коды не меняй. Отвечай коротко.",
+            "Не складывай и не усредняй числа самостоятельно. Коды и числа не изменяй."
+            "Если частичные ответы противоречат друг другу, укажи, что данных недостаточно."
         },
         {"role": "user", "content": f"Частичные ответы:\n{joined}\n\nВопрос: {question}"}
     ]
@@ -220,11 +269,12 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     text = llm.chat(messages).content.strip()
     docs = sorted(
         {
-            _doc(c)
+            _doc(chunk)
             for _, _, community in partials
             for node in community.nodes
-            for c in kb.graph.nodes[node].get("sources", [])
+            for chunk in kb.graph.nodes[node].get("sources", [])
         }
     )
 
-    return Answer(text, docs, [answer for _, answer, _ in partials])
+    refused = not text or ("не найдено" in text.lower() and "базе знаний" in text.lower())
+    return Answer(text or NOT_FOUND, docs, [answer for _, answer, _ in partials], refused)

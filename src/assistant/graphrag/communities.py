@@ -17,17 +17,21 @@ def detect_communities(graph: nx.DiGraph) -> list[Community]:
 
     Каждый узел входит ровно в одно сообщество. Поле `summary` здесь остаётся пустым.
     """
+    if graph.number_of_nodes() == 0:
+        return []
+    
     # снять направление рёбер, разбить с учётом weight, вернуть Community с номерами по порядку
     undirected = nx.Graph()
     undirected.add_nodes_from(sorted(graph.nodes))
 
     for source, target, data in graph.edges(data=True):
-        weight = data.get("weight", 1) + (
-            undirected[source][target]["weight"] if undirected.has_edge(source, target) else 0
-        )
+        weight = max(1, data.get("weight", 1))
+        if undirected.has_edge(source, target):
+            undirected[source][target]["weight"] += weight
+        else:
+            undirected.add_edge(source, target, weight=weight)
 
-        undirected.add_edge(source, target, weight=weight)
-
+    # Louvain требует рёбра, изолированные узлы остаются отдельными группами
     parts = nx.community.louvain_communities(undirected, weight="weight", seed=SEED)
     ordered = sorted((sorted(part) for part in parts), key=lambda nodes: nodes[0])
     return [Community(number, nodes) for number, nodes in enumerate(ordered)]
@@ -39,10 +43,41 @@ def _name(graph: nx.DiGraph, node: str) -> str:
 
 def _line_of(graph: nx.DiGraph, model: str) -> str:
     for target in graph.successors(model):
-        if graph.edges[model, target]["type"] == "BELONGS_TO":
+        if graph.edges[model, target].get("type") == "BELONGS_TO":
             return _name(graph, target)
 
     return "без линейки"
+
+
+def failure_statistics(graph: nx.DiGraph) -> dict[str, Counter]:
+    """
+    """
+    failures: dict[str, Counter] = defaultdict(Counter)
+    for source, target, data in graph.edges(data=True):
+        if data.get("type") != "FAILED":
+            continue
+
+        if graph.nodes[source].get("type") != "Model":
+            continue
+
+        line = _line_of(graph, source)
+        component = _name(graph, target)
+        failures[line][component] += data.get("weight", 1)
+
+    return failures
+
+
+def _failure_lines(graph: nx.DiGraph) -> list[str]:
+    lines: list[str] = []
+
+    for line, counter in sorted(failure_statistics(graph).items()):
+        ranking = ", ".join(
+            f"{name} — {count}" for name, count in counter.most_common()
+        )
+
+        lines.append(f"Отказы по линейке {line} (число отчётов): {ranking}")
+
+    return lines
 
 
 def community_facts(community: Community, graph: nx.DiGraph) -> str:
@@ -50,27 +85,32 @@ def community_facts(community: Community, graph: nx.DiGraph) -> str:
     members = set(community.nodes)
     types = Counter(graph.nodes[node]["type"] for node in members)
     edges = sorted(
-        ((s, t, d) for s, t, d in graph.edges(data=True) if s in members and t in members),
-        key=lambda edge: (-edge[2].get("weight", 1), edge[0], edge[1])
+        (
+            (source, target, data)
+            for source, target, data in graph.edges(data=True) 
+            if source in members and target in members
+        ), 
+        key=lambda edge: (-edge[2].get("weight", 1), edge[0], edge[1]),
     )
 
-    lines = [f"Узлов: {len(members)} (" + ", ".join(f"{k}: {v}" for k, v in sorted(types.items())) + ")"]
-    lines.append(f"Связей внутри сообщества: {len(edges)}")
-    failures: dict[str, Counter] = defaultdict(Counter)
-
-    for source, target, data in edges:
-        if data["type"] == "FAILED":
-            failures[_line_of(graph, source)][_name(graph, target)] += data.get("weight", 1)
-
-    for line, counter in sorted(failures.items()):
-        ranking = ", ".join(f"{name} - {count}" for name, count in counter.most_common())
-        lines.append(f"Отказы узлов в линейке {line} (число отчётов): {ranking}")
-
-    lines.append("Самые тяжёлые связи (вес - число документов, где связь найдена):")
-
+    lines = [
+        f"Узлов: {len(members)} ("
+        + ", ".join(f"{kind}: {count}" for kind, count in sorted(types.items()))
+        + ")",
+        f"Связей внутри сообщества: {len(edges)}",
+        "Глобальная статистика отказов по всему графу (не ограничена сообществом):",
+    ]
+        
+    stats = _failure_lines(graph)
+    lines.extend(stats or ["Связи FAILED в графе отсутствуют."])
+    lines.append("Факты внутри сообщества:")
+    
     for source, target, data in edges[:MAX_EDGES_IN_PROMPT]:
-        lines.append(f"{_name(graph, source)} -{data['type']}-> {_name(graph, target)} (вес {data.get('weight', 1)})")
-
+        lines.append(
+            f"{_name(graph, source)} -{data['type']}-> {_name(graph, target)} "
+            f"(вес {data.get('weight', 1)})"
+        )
+    
     return "\n".join(lines)
 
 
